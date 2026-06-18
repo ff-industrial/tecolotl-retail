@@ -418,24 +418,10 @@ try:
             )
 
         # -------------------------------------------------------------------
-        # Display frame
+        # System monitor overlay
         # -------------------------------------------------------------------
-        cv2.imshow(WINDOW_NAME, frame)
-
-
         temp = get_cpu_temp()
         cpu_usage = psutil.cpu_percent()
-        if temp is not None:
-            cv2.putText(
-                frame,
-                f"CPU: {temp:.1f} C | FPS: {fps:.1f}",
-                (10, 25),
-                FONT,
-                0.6,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
         cv2.putText(
             frame,
             f"CPU: {temp:.1f} C | Load: {cpu_usage:.0f}% | FPS: {fps:.1f}",
@@ -446,6 +432,10 @@ try:
             2,
             cv2.LINE_AA,
         )
+        # -------------------------------------------------------------------
+        # Display frame
+        # -------------------------------------------------------------------
+        cv2.imshow(WINDOW_NAME, frame)
 
         # Press q to exit.
         if cv2.waitKey(1) & 0xFF == ord("q"):
