@@ -25,6 +25,8 @@ The business logic remains the same:
 import time
 import cv2
 import numpy as np
+import os
+import psutil
 from picamera2 import Picamera2
 
 from pose_detector import YOLOPoseDetector, Pose, print_pose
@@ -299,6 +301,15 @@ def draw_person(
         cv2.LINE_AA,
     )
 
+def get_cpu_temp():
+    """
+    Returns Raspberry Pi CPU temperature in Celsius.
+    """
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return int(f.read()) / 1000.0
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -410,6 +421,31 @@ try:
         # Display frame
         # -------------------------------------------------------------------
         cv2.imshow(WINDOW_NAME, frame)
+
+
+        temp = get_cpu_temp()
+        cpu_usage = psutil.cpu_percent()
+        if temp is not None:
+            cv2.putText(
+                frame,
+                f"CPU: {temp:.1f} C | FPS: {fps:.1f}",
+                (10, 25),
+                FONT,
+                0.6,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            frame,
+            f"CPU: {temp:.1f} C | Load: {cpu_usage:.0f}% | FPS: {fps:.1f}",
+            (10, 25),
+            FONT,
+            0.6,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
         # Press q to exit.
         if cv2.waitKey(1) & 0xFF == ord("q"):
