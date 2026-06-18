@@ -1,60 +1,97 @@
 """
 pose_detector.py — Tecolotl Retail
 ===================================
-Parses raw IMX500 HigherHRNet metadata into structured Pose objects.
+Runs YOLO pose estimation directly on the Raspberry Pi using a normal camera.
 
-Based on the official Raspberry Pi picamera2 demo:
-https://github.com/raspberrypi/picamera2/blob/main/examples/imx500/imx500_pose_estimation_higherhrnet_demo.py
+This replaces the previous IMX500/HigherHRNet pipeline.
 
-The IMX500 pipeline internally uses postprocess_higherhrnet from:
-picamera2.devices.imx500.postprocess_highernet
+Previous pipeline:
+    IMX500 metadata -> HigherHRNet postprocess -> Pose objects
 
-That function handles:
-- Raw output tensor decoding
-- Heatmap decoding
-- Keypoint grouping per person
-- Bounding box calculation
-- Confidence threshold filtering
+New pipeline:
+    Camera frame -> YOLO pose model -> Pose objects
 
-This module wraps that pipeline and exposes clean Pose objects
-for use by person_tracker.py and the future shelf_attention module.
+The important architectural idea is that the rest of the project does not need
+to know which model produced the pose. This module still exposes the same
+internal data structures:
+
+- Keypoint
+- Pose
+- print_pose()
+
+That means shelf_attention.py can continue importing:
+
+    from pose_detector import Pose
+
+YOLO pose models use the COCO 17-keypoint format, which matches the structure
+we were already using with HigherHRNet.
+
+Recommended starting model for Raspberry Pi:
+    yolov8n-pose.pt
+
+For better performance, reduce imgsz to 320.
+For better accuracy, increase imgsz to 480 or 640, but FPS will drop.
 """
 
-# Import libraries
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
-
+from dataclasses import dataclass
 import numpy as np
-from picamera2.devices.imx500 import IMX500
-from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
+from ultralytics import YOLO
+
 
 # ---------------------------------------------------------------------------
 # COCO keypoint index constants
-# Reference: https://github.com/raspberrypi/picamera2 — COCO keypoint format
 # ---------------------------------------------------------------------------
-KP_NOSE          = 0
-KP_LEFT_EYE      = 1
-KP_RIGHT_EYE     = 2
-KP_LEFT_EAR      = 3
-KP_RIGHT_EAR     = 4
-KP_LEFT_SHOULDER = 5
-KP_RIGHT_SHOULDER= 6
-KP_LEFT_ELBOW    = 7
-KP_RIGHT_ELBOW   = 8
-KP_LEFT_WRIST    = 9
-KP_RIGHT_WRIST   = 10
-KP_LEFT_HIP      = 11
-KP_RIGHT_HIP     = 12
-KP_LEFT_KNEE     = 13
-KP_RIGHT_KNEE    = 14
-KP_LEFT_ANKLE    = 15
-KP_RIGHT_ANKLE   = 16
+# YOLO pose uses the same 17-keypoint COCO order:
+#
+# 0  nose
+# 1  left_eye
+# 2  right_eye
+# 3  left_ear
+# 4  right_ear
+# 5  left_shoulder
+# 6  right_shoulder
+# 7  left_elbow
+# 8  right_elbow
+# 9  left_wrist
+# 10 right_wrist
+# 11 left_hip
+# 12 right_hip
+# 13 left_knee
+# 14 right_knee
+# 15 left_ankle
+# 16 right_ankle
+# ---------------------------------------------------------------------------
+
+KP_NOSE           = 0
+KP_LEFT_EYE       = 1
+KP_RIGHT_EYE      = 2
+KP_LEFT_EAR       = 3
+KP_RIGHT_EAR      = 4
+KP_LEFT_SHOULDER  = 5
+KP_RIGHT_SHOULDER = 6
+KP_LEFT_ELBOW     = 7
+KP_RIGHT_ELBOW    = 8
+KP_LEFT_WRIST     = 9
+KP_RIGHT_WRIST    = 10
+KP_LEFT_HIP       = 11
+KP_RIGHT_HIP      = 12
+KP_LEFT_KNEE      = 13
+KP_RIGHT_KNEE     = 14
+KP_LEFT_ANKLE     = 15
+KP_RIGHT_ANKLE    = 16
+
 
 # All 17 COCO keypoints — exposed for current and future use.
-# Immediately useful: nose, shoulders, hips (orientation), eyes/ears (head direction)
-# Future use: wrists + elbows for arm vector → detect if someone reaches toward a shelf
+# Immediately useful:
+# - nose
+# - shoulders
+# - hips
+#
+# Future retail use:
+# - wrists + elbows for detecting if someone reaches toward a shelf
+# - eyes/ears for estimating head direction
 RETAIL_KEYPOINTS = {
     "nose":            KP_NOSE,
     "left_eye":        KP_LEFT_EYE,
@@ -75,11 +112,14 @@ RETAIL_KEYPOINTS = {
     "right_ankle":     KP_RIGHT_ANKLE,
 }
 
-# Default window size — must match the IMX500 inference resolution
-WINDOW_SIZE_H_W = (480, 640)
 
-# Default confidence threshold (matches the official demo default)
-DEFAULT_DETECTION_THRESHOLD = 0.3
+# ---------------------------------------------------------------------------
+# Default YOLO configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL_PATH = "yolov8n-pose.pt"
+DEFAULT_CONFIDENCE = 0.30
+DEFAULT_IMAGE_SIZE = 320
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +128,13 @@ DEFAULT_DETECTION_THRESHOLD = 0.3
 
 @dataclass
 class Keypoint:
+    """
+    A single body keypoint.
+
+    x:          Horizontal coordinate in image pixels.
+    y:          Vertical coordinate in image pixels.
+    confidence: Model confidence for this specific keypoint.
+    """
     x: float
     y: float
     confidence: float
@@ -104,7 +151,7 @@ class Pose:
 
     keypoints: list of 17 Keypoint objects in COCO order.
     box:       [x1, y1, x2, y2] in image coordinates.
-    score:     overall detection confidence from HigherHRNet.
+    score:     overall person detection confidence from YOLO.
     """
     keypoints: list[Keypoint]
     box: np.ndarray
@@ -115,7 +162,7 @@ class Pose:
         return self.keypoints[index]
 
     def retail_keypoints(self) -> dict[str, Keypoint]:
-        """Return only the keypoints relevant for shelf attention."""
+        """Return all named keypoints useful for retail analytics."""
         return {name: self.keypoints[idx] for name, idx in RETAIL_KEYPOINTS.items()}
 
     @property
@@ -156,73 +203,159 @@ class Pose:
 
 
 # ---------------------------------------------------------------------------
-# Core parsing function
+# YOLO pose detector
+# ---------------------------------------------------------------------------
+
+class YOLOPoseDetector:
+    """
+    Wrapper around a YOLO pose model.
+
+    This class converts raw Ultralytics YOLO outputs into the internal Pose
+    format used by shelf_attention.py.
+
+    Why use a class instead of a simple function?
+    ------------------------------------------------
+    Because the YOLO model should be loaded only once.
+
+    Bad:
+        load model -> detect
+        load model -> detect
+        load model -> detect
+
+    Good:
+        load model once
+        detect many frames
+
+    Usage:
+        detector = YOLOPoseDetector("yolov8n-pose.pt")
+        poses = detector.get_poses(frame_bgr)
+    """
+
+    def __init__(
+        self,
+        model_path: str = DEFAULT_MODEL_PATH,
+        confidence_threshold: float = DEFAULT_CONFIDENCE,
+        image_size: int = DEFAULT_IMAGE_SIZE,
+        debug: bool = False,
+    ):
+        """
+        Load YOLO pose model.
+
+        Args:
+            model_path:            Path/name of YOLO pose model.
+            confidence_threshold:  Minimum person detection confidence.
+            image_size:            Inference image size. Lower = faster, less accurate.
+            debug:                 Prints extra information during startup.
+        """
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.image_size = image_size
+        self.debug = debug
+
+        if self.debug:
+            print(f"[pose_detector] Loading YOLO model: {self.model_path}")
+
+        self.model = YOLO(self.model_path)
+
+        if self.debug:
+            print("[pose_detector] YOLO model loaded successfully")
+
+    def get_poses(self, frame_bgr: np.ndarray) -> list[Pose]:
+        """
+        Run YOLO pose estimation on a BGR OpenCV frame.
+
+        Args:
+            frame_bgr:
+                Image frame in BGR format.
+                This is the normal format used by OpenCV.
+
+        Returns:
+            List of Pose objects.
+            Empty list if no people are detected.
+        """
+
+        # Run YOLO inference.
+        # verbose=False keeps the terminal clean.
+        results = self.model(
+            frame_bgr,
+            imgsz=self.image_size,
+            conf=self.confidence_threshold,
+            verbose=False,
+        )
+
+        if not results:
+            return []
+
+        result = results[0]
+
+        # If YOLO found no pose/keypoint data, return no detections.
+        if result.keypoints is None or result.boxes is None:
+            return []
+
+        # YOLO keypoints:
+        # xy shape:   (N, 17, 2)
+        # conf shape: (N, 17)
+        #
+        # N = number of detected people.
+        keypoints_xy = result.keypoints.xy.cpu().numpy()
+        keypoints_conf = result.keypoints.conf.cpu().numpy()
+
+        # YOLO boxes:
+        # boxes_xyxy shape: (N, 4)
+        # scores shape:    (N,)
+        boxes_xyxy = result.boxes.xyxy.cpu().numpy()
+        scores = result.boxes.conf.cpu().numpy()
+
+        poses: list[Pose] = []
+
+        for i in range(len(keypoints_xy)):
+            kps: list[Keypoint] = []
+
+            for j in range(17):
+                x = float(keypoints_xy[i][j][0])
+                y = float(keypoints_xy[i][j][1])
+                conf = float(keypoints_conf[i][j])
+
+                kps.append(Keypoint(x=x, y=y, confidence=conf))
+
+            poses.append(
+                Pose(
+                    keypoints=kps,
+                    box=np.array(boxes_xyxy[i]),
+                    score=float(scores[i]),
+                )
+            )
+
+        return poses
+
+
+# ---------------------------------------------------------------------------
+# Compatibility helper
 # ---------------------------------------------------------------------------
 
 def get_poses(
-    metadata: dict,
-    imx500: IMX500,
-    window_size: tuple[int, int] = WINDOW_SIZE_H_W,
-    detection_threshold: float = DEFAULT_DETECTION_THRESHOLD,
-    debug: bool = False,
+    frame_bgr: np.ndarray,
+    detector: YOLOPoseDetector,
 ) -> list[Pose]:
     """
-    Parse IMX500 metadata into a list of Pose objects.
+    Small compatibility function.
 
-    This is the primary interface for downstream consumers
-    (person_tracker.py, shelf_attention.py).
+    This keeps a similar name to the previous IMX500 version, but now receives:
 
-    Args:
-        metadata:            Raw metadata dict from request.get_metadata()
-        imx500:              IMX500 device instance (used to extract output tensors)
-        window_size:         (height, width) of the inference window
-        detection_threshold: Minimum confidence to include a detection
+        frame_bgr + detector
 
-    Returns:
-        List of Pose objects. Empty list if no detections or no tensor output.
+    instead of:
 
-    Usage:
-        poses = get_poses(request.get_metadata(), imx500)
-        for pose in poses:
-            print(pose.score, pose.nose.x, pose.nose.y)
+        metadata + imx500
+
+    Recommended usage in main:
+        detector = YOLOPoseDetector()
+        poses = detector.get_poses(frame)
+
+    Alternative usage:
+        poses = get_poses(frame, detector)
     """
-    np_outputs = imx500.get_outputs(metadata=metadata, add_batch=True)
-
-    if np_outputs is None:
-        if debug:
-            print("[pose_detector] No IMX500 outputs")
-        return []
-
-    keypoints_raw, scores, boxes = postprocess_higherhrnet(
-        outputs=np_outputs,
-        img_size=window_size,
-        img_w_pad=(0, 0),
-        img_h_pad=(0, 0),
-        detection_threshold=detection_threshold,
-        network_postprocess=True,
-    )
-
-    if scores is None or len(scores) == 0:
-        return []
-
-    # keypoints_raw shape: (N, 17, 3) — [x, y, confidence] per keypoint per person
-    keypoints_array = np.reshape(
-        np.stack(keypoints_raw, axis=0), (len(scores), 17, 3)
-    )
-
-    poses = []
-    for i, score in enumerate(scores):
-        kps = [
-            Keypoint(x=float(kp[0]), y=float(kp[1]), confidence=float(kp[2]))
-            for kp in keypoints_array[i]
-        ]
-        poses.append(Pose(
-            keypoints=kps,
-            box=np.array(boxes[i]),
-            score=float(score),
-        ))
-
-    return poses
+    return detector.get_poses(frame_bgr)
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +365,10 @@ def get_poses(
 def print_pose(pose: Pose) -> None:
     """Print a human-readable summary of a Pose. Useful during development."""
     print(f"  Score: {pose.score:.2f}  Box: {pose.box}")
+
     for name, kp in pose.retail_keypoints().items():
         status = "✓" if kp.is_valid() else "✗"
-        print(f"  [{status}] {name:20s}  x={kp.x:.1f}  y={kp.y:.1f}  conf={kp.confidence:.2f}")
-
-
-
+        print(
+            f"  [{status}] {name:20s}  "
+            f"x={kp.x:.1f}  y={kp.y:.1f}  conf={kp.confidence:.2f}"
+        )
